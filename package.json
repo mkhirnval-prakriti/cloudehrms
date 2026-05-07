@@ -1,0 +1,38 @@
+{
+  "name": "hrms-portal",
+  "version": "2.0.0",
+  "description": "HRMS Portal — Free-tier production deployment (PostgreSQL + Vercel/Render)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "dev": "cd client && npm run dev",
+    "dev:server": "node server.js",
+    "start": "node server.js",
+    "build": "npm run build --prefix client",
+    "postinstall": "npm install --prefix client"
+  },
+  "keywords": ["hrms", "attendance", "portal"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@simplewebauthn/server": "^10.0.1",
+    "bcryptjs": "^3.0.2",
+    "compression": "^1.8.1",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
+    "express": "^4.22.1",
+    "express-rate-limit": "^8.3.2",
+    "express-session": "^1.18.1",
+    "googleapis": "^144.0.0",
+    "jpeg-js": "^0.4.4",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^1.4.5-lts.2",
+    "nodemailer": "^7.0.11",
+    "pdfkit": "^0.17.2",
+    "pg": "^8.20.0",
+    "web-push": "^3.6.7"
+  }
+}

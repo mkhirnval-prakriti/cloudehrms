@@ -1,0 +1,33 @@
+export const Colors = {
+  light: {
+    primary: '#1f5e3b',
+    primaryLight: '#2a7a50',
+    primaryDark: '#174d30',
+    primarySurface: '#e8f5ee',
+    accent: '#4caf50',
+    background: '#f4f7f4',
+    card: '#ffffff',
+    cardBorder: '#e0e7e3',
+    text: '#1b2b21',
+    textMuted: '#6b9080',
+    textLight: '#9cb8a8',
+    border: '#e0e7e3',
+    success: '#22c55e',
+    successSurface: '#dcfce7',
+    warning: '#f59e0b',
+    warningSurface: '#fef3c7',
+    error: '#ef4444',
+    errorSurface: '#fee2e2',
+    gold: '#c9a227',
+    tabBar: '#ffffff',
+    tabBarBorder: '#e8ede9',
+    tabBarActive: '#1f5e3b',
+    tabBarInactive: '#9cb8a8',
+    inputBg: '#f9fafb',
+    radius: 14,
+    radiusSmall: 8,
+    radiusLarge: 24,
+  },
+} as const;
+
+export type ColorScheme = typeof Colors.light;

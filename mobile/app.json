@@ -1,0 +1,64 @@
+{
+  "expo": {
+    "name": "Prakriti Herbs HRMS",
+    "slug": "hrms-portal",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "hrmsportal",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/images/icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1f5e3b"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.hrmsportal.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Attendance \u0915\u0947 \u0932\u093f\u090f GPS location \u091c\u093c\u0930\u0942\u0930\u0940 \u0939\u0948\u0964",
+        "NSFaceIDUsageDescription": "Secure attendance \u0915\u0947 \u0932\u093f\u090f biometric \u091c\u093c\u0930\u0942\u0930\u0940 \u0939\u0948\u0964",
+        "NSLocalNetworkUsageDescription": "Office WiFi verification \u0915\u0947 \u0932\u093f\u090f \u091c\u093c\u0930\u0942\u0930\u0940 \u0939\u0948\u0964"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/icon.png",
+        "backgroundColor": "#1f5e3b"
+      },
+      "package": "com.hrmsportal.app",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION",
+        "USE_BIOMETRIC",
+        "USE_FINGERPRINT",
+        "ACCESS_WIFI_STATE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/images/icon.png",
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      [
+        "expo-router",
+        {
+          "origin": "https://yourdomain.com"
+        }
+      ],
+      "expo-font",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Attendance \u0915\u0947 \u0932\u093f\u090f location access \u091c\u093c\u0930\u0942\u0930\u0940 \u0939\u0948\u0964"
+        }
+      ],
+      "expo-local-authentication"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

@@ -1,0 +1,72 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Render Blueprint — Free Tier Deployment
+# https://render.com/docs/blueprint-spec
+#
+# FREE TIER NOTES:
+#   • No persistent disk → use Neon / Supabase PostgreSQL (DATABASE_URL)
+#   • Spins down after 15 min inactivity → set up UptimeRobot to ping /health
+#   • First request after sleep = 30-60 s cold start (normal for free tier)
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  - type: web
+    name: hrms-portal
+    runtime: node
+    plan: free
+    region: singapore       # Closest to India
+    buildCommand: bash build.sh
+    startCommand: bash start.sh
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # ── Database (set in Render dashboard) ──────────────────────────────
+      # Paste your Neon / Supabase connection string here
+      - key: DATABASE_URL
+        sync: false          # Secret — set manually in dashboard
+      - key: DB_SSL
+        value: "1"
+
+      # ── Admin login ──────────────────────────────────────────────────────
+      # Login ID:  prakritiherbs
+      # Password:  52265226  (change via Settings panel after first login)
+      - key: SUPER_ADMIN_PASSWORD
+        value: "52265226"    # Applied once on first boot; then ignored
+      - key: SUPER_ADMIN_EMAIL
+        sync: false          # Set your admin email in dashboard
+
+      # ── Auto-generated secrets ────────────────────────────────────────────
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: JWT_SECRET
+        generateValue: true
+
+      # ── CORS — set after you know your Vercel URL ─────────────────────────
+      - key: ALLOWED_ORIGINS
+        sync: false          # e.g. https://hrms-portal.vercel.app
+      - key: CORS_STRICT
+        value: "1"
+
+      # ── Email (optional but recommended) ─────────────────────────────────
+      # - key: SMTP_HOST
+      #   value: smtp.gmail.com
+      # - key: SMTP_PORT
+      #   value: "587"
+      # - key: SMTP_USER
+      #   sync: false
+      # - key: SMTP_PASS
+      #   sync: false
+
+      # ── Google Sheets Sync (optional) ────────────────────────────────────
+      # - key: GOOGLE_APPS_SCRIPT_WEBAPP_URL
+      #   sync: false
+      # - key: SHEET_SYNC_SECRET
+      #   sync: false
+
+      # ── Attendance settings ────────────────────────────────────────────────
+      - key: FACE_EMBEDDING_MATCH_THRESHOLD
+        value: "0.55"
+      - key: TRASH_RETENTION_MODE
+        value: days
+      - key: TRASH_RETENTION_DAYS
+        value: "30"

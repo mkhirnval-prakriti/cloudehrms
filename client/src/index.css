@@ -1,0 +1,120 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "DM Sans", "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-ph-brand: #1f5e3b;
+  --color-ph-green-mid: #4caf50;
+  --color-ph-green-light: #81c784;
+  --color-ph-mint: #f4f7f4;
+  --color-ph-bg: #f4f7f4;
+  --color-ph-card: #ffffff;
+  --color-ph-brown: #8d6e63;
+  --color-ph-gold: #c9a227;
+  --color-ph-text-dark: #1b2b21;
+  --color-ph-border: #e0e7e3;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background:
+    radial-gradient(circle at 12% 14%, rgba(129, 199, 132, 0.1) 0%, transparent 28%),
+    radial-gradient(circle at 82% 82%, rgba(31, 94, 59, 0.08) 0%, transparent 26%),
+    linear-gradient(165deg, #f7faf7 0%, #f4f7f4 45%, #eef4ee 100%);
+  color: var(--color-ph-text-dark);
+}
+
+/* Premium sidebar / header gradient */
+.ph-brand-gradient {
+  background: linear-gradient(160deg, #1f5e3b 0%, #2f7a4a 38%, #1f5e3b 100%);
+}
+
+.ph-glass {
+  background: rgba(255, 255, 255, 0.72);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.ph-card {
+  @apply border bg-white shadow-[0_6px_20px_rgba(27,43,33,0.08)] transition duration-200;
+  border-color: var(--color-ph-border);
+  border-radius: 8px;
+}
+
+.ph-card:hover {
+  box-shadow: 0 10px 24px rgba(31, 94, 59, 0.12);
+  transform: translateY(-1px);
+}
+
+.ph-stat-tall {
+  @apply overflow-hidden shadow-[0_8px_24px_rgba(27,43,33,0.12)] transition duration-300;
+  border-radius: 8px;
+}
+
+.ph-stat-tall:hover {
+  transform: translateY(-2px) scale(1.005);
+  box-shadow: 0 14px 30px rgba(31, 94, 59, 0.16);
+}
+
+/* Enforce consistent radius + borders across cards/buttons */
+.rounded-2xl,
+.rounded-xl {
+  border-radius: 8px !important;
+}
+
+button {
+  transition: all 180ms ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+}
+
+.ph-kpi-value {
+  font-size: 34px;
+  line-height: 1.05;
+  font-weight: 800;
+}
+
+/* Logo loader — orbit ring (premium, no text) */
+@keyframes ph-orbit {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes ph-pulse-logo {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.92;
+    transform: scale(0.98);
+  }
+}
+
+.ph-loader-orbit {
+  animation: ph-orbit 2.2s linear infinite;
+}
+
+.ph-loader-logo {
+  animation: ph-pulse-logo 2s ease-in-out infinite;
+}

@@ -1,0 +1,66 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
+.env.*.local
+*.secret
+vapid.json
+
+# ── Node ─────────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+
+# ── Build output ──────────────────────────────────────────────────────────────
+dist/
+client/dist/
+*.tsbuildinfo
+
+# ── Database & backups (NEVER commit) ─────────────────────────────────────────
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/backups/
+data/seed-credentials.txt
+*.db
+
+# ── User-uploaded files ────────────────────────────────────────────────────────
+uploads/
+!uploads/.gitkeep
+
+# ── Exports ───────────────────────────────────────────────────────────────────
+exports/
+
+# ── Replit artifacts ──────────────────────────────────────────────────────────
+.replit
+.agents/
+.local/
+.config/
+attached_assets/
+
+# ── Mobile ────────────────────────────────────────────────────────────────────
+mobile/.expo/
+mobile/node_modules/
+mobile/dist/
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── Service account keys ──────────────────────────────────────────────────────
+google-service-account.json
+service-account*.json
+*.pem
+*.key
+*.p12
