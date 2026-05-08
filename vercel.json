@@ -1,10 +1,13 @@
 {
   "version": 2,
-  "name": "hrms-portal-frontend",
-  "buildCommand": "npm run build --prefix client",
+  "name": "hrms-portal",
+  "buildCommand": "npm install --prefix client && npm run build --prefix client",
   "outputDirectory": "dist",
+  "installCommand": "echo 'deps handled in buildCommand'",
   "framework": null,
   "rewrites": [
+    { "source": "/api/(.*)", "destination": "https://RENDER_BACKEND_URL/api/$1" },
+    { "source": "/uploads/(.*)", "destination": "https://RENDER_BACKEND_URL/uploads/$1" },
     { "source": "/(.*)", "destination": "/index.html" }
   ],
   "headers": [
@@ -18,7 +21,8 @@
       "source": "/(.*)",
       "headers": [
         { "key": "X-Content-Type-Options", "value": "nosniff" },
-        { "key": "X-Frame-Options", "value": "SAMEORIGIN" }
+        { "key": "X-Frame-Options", "value": "SAMEORIGIN" },
+        { "key": "X-XSS-Protection", "value": "1; mode=block" }
       ]
     }
   ]
