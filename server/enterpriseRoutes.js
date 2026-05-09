@@ -31,7 +31,7 @@ function registerEnterpriseRoutes(router, ctx) {
         `SELECT id, email, login_id, full_name, role, branch_id, department
          FROM users
          WHERE active = 1 AND deleted_at IS NULL AND (
-           lower(full_name) LIKE lower(?) OR lower(email) LIKE lower(?) OR lower(ifnull(login_id,'')) LIKE lower(?) OR lower(ifnull(department,'')) LIKE lower(?)
+           lower(full_name) LIKE lower(?) OR lower(email) LIKE lower(?) OR lower(coalesce(login_id,'')) LIKE lower(?) OR lower(coalesce(department,'')) LIKE lower(?)
          )
          ORDER BY full_name LIMIT 30`
       )

@@ -840,7 +840,7 @@ function doPost(e) {
     const user = db
       .prepare(
         `SELECT id, email, login_id, password_hash, full_name, role, branch_id, active, account_status, rejection_reason FROM users
-         WHERE (lower(email) = lower(?) OR lower(mobile) = ? OR lower(ifnull(login_id,'')) = lower(?)) AND deleted_at IS NULL`
+         WHERE (lower(email) = lower(?) OR lower(mobile) = ? OR lower(coalesce(login_id,'')) = lower(?)) AND deleted_at IS NULL`
       )
       .get(idOrEmail, idOrEmail, idOrEmail);
     if (!user) {
@@ -1095,7 +1095,7 @@ function doPost(e) {
       const user = db
         .prepare(
           `SELECT id, email FROM users WHERE deleted_at IS NULL AND active = 1 AND (
-            lower(email) = lower(?) OR replace(ifnull(mobile,''),' ','') = replace(?,' ','')
+            lower(email) = lower(?) OR replace(coalesce(mobile,''),' ','') = replace(?,' ','')
           )`
         )
         .get(idOrMobile, idOrMobile);
@@ -1130,7 +1130,7 @@ function doPost(e) {
     const user = db
       .prepare(
         `SELECT id, email FROM users WHERE deleted_at IS NULL AND active = 1 AND (
-          lower(email) = lower(?) OR replace(ifnull(mobile,''),' ','') = replace(?,' ','')
+          lower(email) = lower(?) OR replace(coalesce(mobile,''),' ','') = replace(?,' ','')
         )`
       )
       .get(emailOrMobile, emailOrMobile);
@@ -2002,7 +2002,7 @@ function doPost(e) {
     const userRow = db
       .prepare(
         `SELECT id, login_id, full_name, active FROM users
-         WHERE lower(ifnull(login_id,'')) = lower(?) AND deleted_at IS NULL`
+         WHERE lower(coalesce(login_id,'')) = lower(?) AND deleted_at IS NULL`
       )
       .get(loginId);
     if (!userRow || !userRow.active) return res.status(404).json({ error: "User not found" });
@@ -2159,7 +2159,7 @@ function doPost(e) {
     const target = db
       .prepare(
         `SELECT id, login_id, full_name, active, deleted_at, kiosk_pin_hash, allow_manual
-         FROM users WHERE lower(ifnull(login_id,'')) = lower(?)`
+         FROM users WHERE lower(coalesce(login_id,'')) = lower(?)`
       )
       .get(loginId);
     if (!target || target.deleted_at || !target.active) return res.status(404).json({ error: "User not found" });
@@ -2249,7 +2249,7 @@ function doPost(e) {
     const target = db
       .prepare(
         `SELECT id, full_name, login_id, active, deleted_at, kiosk_pin_hash
-         FROM users WHERE lower(ifnull(login_id,'')) = lower(?) AND active = 1 AND deleted_at IS NULL`
+         FROM users WHERE lower(coalesce(login_id,'')) = lower(?) AND active = 1 AND deleted_at IS NULL`
       )
       .get(loginId);
     if (!target) return res.status(404).json({ error: "Employee not found" });
