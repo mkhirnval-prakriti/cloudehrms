@@ -1,12 +1,18 @@
 "use strict";
 /**
- * HRMS Portal — PostgreSQL Database Layer
- * Replaces SQLite (node:sqlite) with pg (PostgreSQL).
+ * HRMS Portal — PostgreSQL Database Layer (SYNC wrapper via deasync)
+ * Provides better-sqlite3 compatible synchronous API on top of pg pool.
  * Compatible with Neon, Supabase, Railway Postgres, or any standard PostgreSQL.
  */
 const { Pool } = require("pg");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
+let deasync = null;
+try {
+  deasync = require("deasync");
+} catch (e) {
+  console.warn("[db] deasync not available - falling back to async-only mode");
+}
 const { ROLES } = require("./rbac");
 
 const HRMS_BOOTSTRAP_PW_KEY = "hrms_bootstrap_admin_password";
@@ -35,11 +41,8 @@ function getPool() {
   return _pool;
 }
 
-// ── SQL compatibility helpers ─────────────────────────────────────────────────
 function toPgSql(sql) {
-  // datetime('now') → NOW()
   sql = sql.replace(/datetime\('now'\)/gi, "NOW()");
-  // datetime('now', '+/-N unit') → NOW() +/- INTERVAL 'N unit'
   sql = sql.replace(
     /datetime\('now',\s*'([+-])(\d+)\s+(days?|hours?|minutes?)'\)/gi,
     (_, dir, amt, unit) => dir === "-"
@@ -48,12 +51,10 @@ function toPgSql(sql) {
   );
   sql = sql.replace(/INTEGER PRIMARY KEY AUTOINCREMENT/gi, "SERIAL PRIMARY KEY");
   sql = sql.replace(/AUTOINCREMENT/gi, "");
-  // INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
   sql = sql.replace(
     /INSERT OR IGNORE INTO (\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/gi,
     (_, table, cols, vals) => `INSERT INTO ${table} (${cols}) VALUES (${vals}) ON CONFLICT DO NOTHING`
   );
-  // Simple fallback for remaining INSERT OR IGNORE
   sql = sql.replace(/INSERT OR IGNORE INTO/gi, "INSERT INTO");
   sql = sql.replace(
     /INSERT OR REPLACE INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/gi,
@@ -67,7 +68,6 @@ function toPgSql(sql) {
 }
 
 function convertPlaceholders(sql, args) {
-  // Named params like @name
   if (args.length === 1 && args[0] !== null && typeof args[0] === "object" && !Array.isArray(args[0])) {
     const obj = args[0];
     const order = [];
@@ -81,26 +81,40 @@ function convertPlaceholders(sql, args) {
     order.forEach((k, i) => { out = out.replace(new RegExp(`@${k}\\b`, "g"), `$${i + 1}`); });
     return { sql: out, values: order.map(k => obj[k] !== undefined ? obj[k] : null) };
   }
-  // Positional ? → $1, $2...
   let i = 0;
   const pgSql = sql.replace(/\?/g, () => `$${++i}`);
   return { sql: pgSql, values: args.map(v => v !== undefined ? v : null) };
 }
 
-// ── DB wrapper (pool-based async, SQLite-compatible API) ──────────────────────
+function makeSyncQuery(pool) {
+  if (!deasync) {
+    throw new Error("deasync not loaded — cannot provide sync query API");
+  }
+  function pgQueryCb(sql, values, cb) {
+    pool.query(sql, values).then(r => cb(null, r)).catch(e => cb(e));
+  }
+  const querySync = deasync(pgQueryCb);
+  return querySync;
+}
+
 function makeDb(pool) {
+  const querySync = makeSyncQuery(pool);
+
   const db = {
     _pool: pool,
 
     exec(sql) {
       const pgSql = toPgSql(sql);
-      // Split on semicolons and run each statement
       const stmts = pgSql.split(";").map(s => s.trim()).filter(s => s.length > 0);
-      return stmts.reduce((p, stmt) => p.then(() => pool.query(stmt).catch(e => {
-        // Ignore "already exists" errors from CREATE IF NOT EXISTS
-        if (e.code === "42P07" || e.code === "42710") return; // table/index exists
-        console.warn("[db] exec warn:", e.message.slice(0, 120));
-      })), Promise.resolve());
+      for (const stmt of stmts) {
+        try {
+          querySync(stmt, []);
+        } catch (e) {
+          if (e.code !== "42P07" && e.code !== "42710") {
+            console.warn("[db] exec warn:", e.message.slice(0, 120));
+          }
+        }
+      }
     },
 
     prepare(sqlIn) {
@@ -109,52 +123,60 @@ function makeDb(pool) {
 
         run(...args) {
           const { sql, values } = convertPlaceholders(sqlIn, args);
-          const pgSql = toPgSql(sql) + (
-            toPgSql(sql).toUpperCase().trim().startsWith("INSERT") && !toPgSql(sql).toUpperCase().includes("RETURNING")
-              ? " RETURNING id"
-              : ""
-          );
-          return pool.query(pgSql, values)
-            .then(res => ({ changes: res.rowCount, lastInsertRowid: res.rows[0]?.id || null }))
-            .catch(e => {
-              if (e.code === "23505" || e.code === "23503") return { changes: 0, lastInsertRowid: null };
-              console.error("[db.run]", e.message, "\nSQL:", pgSql.slice(0, 200));
-              return { changes: 0, lastInsertRowid: null };
-            });
+          let pgSql = toPgSql(sql);
+          const upper = pgSql.toUpperCase().trim();
+          if (upper.startsWith("INSERT") && !upper.includes("RETURNING")) {
+            const tablesNoId = /INTO\s+(visibility_settings|branch_access_rules|notice_reads|integration_kv|user_face_profiles|user_role_assignments)\b/i;
+            if (!tablesNoId.test(pgSql)) {
+              pgSql += " RETURNING id";
+            }
+          }
+          try {
+            const res = querySync(pgSql, values);
+            return { changes: res.rowCount, lastInsertRowid: res.rows && res.rows[0] ? res.rows[0].id : null };
+          } catch (e) {
+            if (e.code === "23505" || e.code === "23503") return { changes: 0, lastInsertRowid: null };
+            console.error("[db.run]", e.message, "\nSQL:", pgSql.slice(0, 200));
+            return { changes: 0, lastInsertRowid: null };
+          }
         },
 
         get(...args) {
           const { sql, values } = convertPlaceholders(sqlIn, args);
           const pgSql = toPgSql(sql);
-          return pool.query(pgSql, values)
-            .then(res => res.rows[0] || null)
-            .catch(e => { console.error("[db.get]", e.message, "\nSQL:", pgSql.slice(0, 200)); return null; });
+          try {
+            const res = querySync(pgSql, values);
+            return res.rows && res.rows[0] ? res.rows[0] : undefined;
+          } catch (e) {
+            console.error("[db.get]", e.message, "\nSQL:", pgSql.slice(0, 200));
+            return undefined;
+          }
         },
 
         all(...args) {
           const { sql, values } = convertPlaceholders(sqlIn, args);
           const pgSql = toPgSql(sql);
-          return pool.query(pgSql, values)
-            .then(res => res.rows)
-            .catch(e => { console.error("[db.all]", e.message, "\nSQL:", pgSql.slice(0, 200)); return []; });
+          try {
+            const res = querySync(pgSql, values);
+            return res.rows || [];
+          } catch (e) {
+            console.error("[db.all]", e.message, "\nSQL:", pgSql.slice(0, 200));
+            return [];
+          }
         },
       };
     },
 
-    // Simplified transaction helper
     transaction(fn) {
-      return async (...fnArgs) => {
-        const client = await pool.connect();
+      return (...fnArgs) => {
         try {
-          await client.query("BEGIN");
-          const result = await fn(...fnArgs);
-          await client.query("COMMIT");
+          querySync("BEGIN", []);
+          const result = fn(...fnArgs);
+          querySync("COMMIT", []);
           return result;
         } catch (e) {
-          await client.query("ROLLBACK");
+          try { querySync("ROLLBACK", []); } catch {}
           throw e;
-        } finally {
-          client.release();
         }
       };
     },
@@ -162,7 +184,6 @@ function makeDb(pool) {
   return db;
 }
 
-// ── KV helpers ────────────────────────────────────────────────────────────────
 async function readKv(pool, key) {
   try {
     const res = await pool.query("SELECT v FROM integration_kv WHERE k = $1", [key]);
@@ -180,7 +201,6 @@ async function writeKv(pool, key, obj) {
   );
 }
 
-// ── Runtime secrets ───────────────────────────────────────────────────────────
 async function hydrateRuntimeSecrets(pool) {
   async function hydrateOne(envName, kvKey, byteLength) {
     const fromEnv = String(process.env[envName] || "").trim();
@@ -196,241 +216,70 @@ async function hydrateRuntimeSecrets(pool) {
   await hydrateOne("JWT_SECRET", "hrms_runtime_jwt_secret", 48);
 }
 
-// ── Schema migrations ─────────────────────────────────────────────────────────
 async function runMigrations(pool) {
   const client = await pool.connect();
   try {
-    // Create tables one by one to handle dependencies
     const stmts = [
-      `CREATE TABLE IF NOT EXISTS branches (
-        id SERIAL PRIMARY KEY, name TEXT NOT NULL, lat REAL, lng REAL,
-        radius_meters INTEGER NOT NULL DEFAULT 300, address TEXT, city TEXT, state TEXT,
-        wifi_enabled INTEGER DEFAULT 0, wifi_ssids TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS branches (id SERIAL PRIMARY KEY, name TEXT NOT NULL, lat REAL, lng REAL, radius_meters INTEGER NOT NULL DEFAULT 300, address TEXT, city TEXT, state TEXT, wifi_enabled INTEGER DEFAULT 0, wifi_ssids TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE UNIQUE INDEX IF NOT EXISTS idx_branches_name ON branches(lower(name))`,
-      `CREATE TABLE IF NOT EXISTS departments (
-        id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, login_id TEXT,
-        password_hash TEXT NOT NULL, full_name TEXT NOT NULL, role TEXT NOT NULL,
-        branch_id INTEGER REFERENCES branches(id),
-        shift_start TEXT NOT NULL DEFAULT '09:00', shift_end TEXT NOT NULL DEFAULT '18:00',
-        grace_minutes INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1,
-        mobile TEXT, department TEXT, allow_gps INTEGER DEFAULT 0, allow_face INTEGER DEFAULT 1,
-        allow_manual INTEGER DEFAULT 0, allow_biometric INTEGER DEFAULT 1, profile_photo TEXT,
-        dob TEXT, address TEXT, account_number TEXT, ifsc TEXT, bank_name TEXT,
-        kiosk_pin_hash TEXT, base_salary_inr REAL DEFAULT 12000, joining_date TEXT,
-        payroll_job_role TEXT DEFAULT 'delivery', min_working_hours_override REAL,
-        account_status TEXT DEFAULT 'ACTIVE', rejection_reason TEXT, registered_via TEXT,
-        deleted_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS departments (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, login_id TEXT, password_hash TEXT NOT NULL, full_name TEXT NOT NULL, role TEXT NOT NULL, branch_id INTEGER REFERENCES branches(id), shift_start TEXT NOT NULL DEFAULT '09:00', shift_end TEXT NOT NULL DEFAULT '18:00', grace_minutes INTEGER NOT NULL DEFAULT 1, active INTEGER NOT NULL DEFAULT 1, mobile TEXT, department TEXT, allow_gps INTEGER DEFAULT 0, allow_face INTEGER DEFAULT 1, allow_manual INTEGER DEFAULT 0, allow_biometric INTEGER DEFAULT 1, profile_photo TEXT, dob TEXT, address TEXT, account_number TEXT, ifsc TEXT, bank_name TEXT, kiosk_pin_hash TEXT, base_salary_inr REAL DEFAULT 12000, joining_date TEXT, payroll_job_role TEXT DEFAULT 'delivery', min_working_hours_override REAL, account_status TEXT DEFAULT 'ACTIVE', rejection_reason TEXT, registered_via TEXT, deleted_at TIMESTAMPTZ, updated_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE UNIQUE INDEX IF NOT EXISTS idx_users_login_id ON users(login_id) WHERE login_id IS NOT NULL`,
       `CREATE INDEX IF NOT EXISTS idx_users_branch ON users(branch_id)`,
       `CREATE INDEX IF NOT EXISTS idx_users_active ON users(active, deleted_at, role)`,
-      `CREATE TABLE IF NOT EXISTS attendance_records (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        work_date TEXT NOT NULL, punch_in_at TIMESTAMPTZ, punch_out_at TIMESTAMPTZ,
-        status TEXT NOT NULL DEFAULT 'absent', half_period TEXT, source TEXT NOT NULL DEFAULT 'device',
-        in_lat REAL, in_lng REAL, out_lat REAL, out_lng REAL, notes TEXT,
-        last_edited_by INTEGER REFERENCES users(id),
-        punch_in_address TEXT, punch_out_address TEXT, in_device_info TEXT, out_device_info TEXT,
-        punch_in_photo TEXT, punch_out_photo TEXT, punch_method_in TEXT, punch_method_out TEXT,
-        device_in TEXT, device_out TEXT, verification_in TEXT, verification_out TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, work_date)
-      )`,
+      `CREATE TABLE IF NOT EXISTS attendance_records (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), work_date TEXT NOT NULL, punch_in_at TIMESTAMPTZ, punch_out_at TIMESTAMPTZ, status TEXT NOT NULL DEFAULT 'absent', half_period TEXT, source TEXT NOT NULL DEFAULT 'device', in_lat REAL, in_lng REAL, out_lat REAL, out_lng REAL, notes TEXT, last_edited_by INTEGER REFERENCES users(id), punch_in_address TEXT, punch_out_address TEXT, in_device_info TEXT, out_device_info TEXT, punch_in_photo TEXT, punch_out_photo TEXT, punch_method_in TEXT, punch_method_out TEXT, device_in TEXT, device_out TEXT, verification_in TEXT, verification_out TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, work_date))`,
       `CREATE INDEX IF NOT EXISTS idx_att_user_date ON attendance_records(user_id, work_date)`,
       `CREATE INDEX IF NOT EXISTS idx_att_work_date ON attendance_records(work_date)`,
       `CREATE INDEX IF NOT EXISTS idx_att_status ON attendance_records(status, work_date)`,
       `CREATE INDEX IF NOT EXISTS idx_att_open_punch ON attendance_records(work_date, punch_in_at) WHERE punch_out_at IS NULL`,
       `CREATE TABLE IF NOT EXISTS integration_kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
-      `CREATE TABLE IF NOT EXISTS notices (
-        id SERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL,
-        created_by INTEGER NOT NULL REFERENCES users(id), active INTEGER NOT NULL DEFAULT 1,
-        visible_from TIMESTAMPTZ, visible_until TIMESTAMPTZ, repeat_rule TEXT,
-        show_on_punch INTEGER DEFAULT 1, notice_type TEXT DEFAULT 'announcement',
-        target_branch_id INTEGER, target_role TEXT, allow_replies INTEGER DEFAULT 1,
-        admin_replies_only INTEGER DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS notice_reads (
-        notice_id INTEGER NOT NULL REFERENCES notices(id), user_id INTEGER NOT NULL REFERENCES users(id),
-        read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (notice_id, user_id)
-      )`,
+      `CREATE TABLE IF NOT EXISTS notices (id SERIAL PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, created_by INTEGER NOT NULL REFERENCES users(id), active INTEGER NOT NULL DEFAULT 1, visible_from TIMESTAMPTZ, visible_until TIMESTAMPTZ, repeat_rule TEXT, show_on_punch INTEGER DEFAULT 1, notice_type TEXT DEFAULT 'announcement', target_branch_id INTEGER, target_role TEXT, allow_replies INTEGER DEFAULT 1, admin_replies_only INTEGER DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS notice_reads (notice_id INTEGER NOT NULL REFERENCES notices(id), user_id INTEGER NOT NULL REFERENCES users(id), read_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY (notice_id, user_id))`,
       `CREATE INDEX IF NOT EXISTS idx_notice_reads_user ON notice_reads(user_id)`,
-      `CREATE TABLE IF NOT EXISTS notice_replies (
-        id SERIAL PRIMARY KEY, notice_id INTEGER NOT NULL REFERENCES notices(id),
-        user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL,
-        is_admin_reply INTEGER DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS notice_replies (id SERIAL PRIMARY KEY, notice_id INTEGER NOT NULL REFERENCES notices(id), user_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, is_admin_reply INTEGER DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_notice_replies_notice ON notice_replies(notice_id)`,
-      `CREATE TABLE IF NOT EXISTS leave_requests (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        start_date TEXT NOT NULL, end_date TEXT NOT NULL, reason TEXT NOT NULL,
-        leave_type TEXT NOT NULL DEFAULT 'casual', final_status TEXT NOT NULL DEFAULT 'PENDING',
-        manager_review TEXT, admin_review TEXT, manager_comment TEXT, admin_comment TEXT,
-        manager_action_at TIMESTAMPTZ, admin_action_at TIMESTAMPTZ,
-        manager_action_by INTEGER REFERENCES users(id), admin_action_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS leave_requests (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), start_date TEXT NOT NULL, end_date TEXT NOT NULL, reason TEXT NOT NULL, leave_type TEXT NOT NULL DEFAULT 'casual', final_status TEXT NOT NULL DEFAULT 'PENDING', manager_review TEXT, admin_review TEXT, manager_comment TEXT, admin_comment TEXT, manager_action_at TIMESTAMPTZ, admin_action_at TIMESTAMPTZ, manager_action_by INTEGER REFERENCES users(id), admin_action_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_leave_user ON leave_requests(user_id)`,
       `CREATE INDEX IF NOT EXISTS idx_leave_status ON leave_requests(final_status)`,
-      `CREATE TABLE IF NOT EXISTS leave_threads (
-        id SERIAL PRIMARY KEY, leave_id INTEGER NOT NULL REFERENCES leave_requests(id),
-        author_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS leave_threads (id SERIAL PRIMARY KEY, leave_id INTEGER NOT NULL REFERENCES leave_requests(id), author_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_leave_threads_leave ON leave_threads(leave_id, id)`,
-      `CREATE TABLE IF NOT EXISTS employee_documents (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        doc_type TEXT NOT NULL, file_name TEXT NOT NULL, file_path TEXT NOT NULL,
-        verified INTEGER NOT NULL DEFAULT 0, doc_status TEXT NOT NULL DEFAULT 'pending',
-        verified_by INTEGER REFERENCES users(id), verified_at TIMESTAMPTZ, verifier_notes TEXT,
-        account_number TEXT, ifsc TEXT, bank_name TEXT,
-        deleted_at TIMESTAMPTZ, deleted_by INTEGER,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS employee_documents (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), doc_type TEXT NOT NULL, file_name TEXT NOT NULL, file_path TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, doc_status TEXT NOT NULL DEFAULT 'pending', verified_by INTEGER REFERENCES users(id), verified_at TIMESTAMPTZ, verifier_notes TEXT, account_number TEXT, ifsc TEXT, bank_name TEXT, deleted_at TIMESTAMPTZ, deleted_by INTEGER, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_employee_documents_user ON employee_documents(user_id)`,
-      `CREATE TABLE IF NOT EXISTS payroll_entries (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        period TEXT NOT NULL, gross_inr REAL NOT NULL DEFAULT 0,
-        deductions_inr REAL NOT NULL DEFAULT 0, net_inr REAL NOT NULL DEFAULT 0, notes TEXT,
-        delivery_amount REAL NOT NULL DEFAULT 0, total_leaves REAL NOT NULL DEFAULT 0,
-        leave_type TEXT NOT NULL DEFAULT 'paid', late_minutes INTEGER NOT NULL DEFAULT 0,
-        incentive_inr REAL NOT NULL DEFAULT 0, leave_deduction_inr REAL NOT NULL DEFAULT 0,
-        late_deduction_inr REAL NOT NULL DEFAULT 0, no_leave_bonus_inr REAL NOT NULL DEFAULT 0,
-        base_salary_snapshot REAL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(user_id, period)
-      )`,
+      `CREATE TABLE IF NOT EXISTS payroll_entries (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), period TEXT NOT NULL, gross_inr REAL NOT NULL DEFAULT 0, deductions_inr REAL NOT NULL DEFAULT 0, net_inr REAL NOT NULL DEFAULT 0, notes TEXT, delivery_amount REAL NOT NULL DEFAULT 0, total_leaves REAL NOT NULL DEFAULT 0, leave_type TEXT NOT NULL DEFAULT 'paid', late_minutes INTEGER NOT NULL DEFAULT 0, incentive_inr REAL NOT NULL DEFAULT 0, leave_deduction_inr REAL NOT NULL DEFAULT 0, late_deduction_inr REAL NOT NULL DEFAULT 0, no_leave_bonus_inr REAL NOT NULL DEFAULT 0, base_salary_snapshot REAL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, period))`,
       `CREATE INDEX IF NOT EXISTS idx_payroll_entries_period ON payroll_entries(period)`,
-      `CREATE TABLE IF NOT EXISTS payroll_special_holidays (
-        id SERIAL PRIMARY KEY, holiday_date TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
-        created_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS payroll_delivery_daily (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        work_date TEXT NOT NULL, amount_inr REAL NOT NULL DEFAULT 0, notes TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, work_date)
-      )`,
-      `CREATE TABLE IF NOT EXISTS user_face_profiles (
-        user_id INTEGER PRIMARY KEY REFERENCES users(id), phash TEXT NOT NULL,
-        reference_path TEXT, embedding_json TEXT, descriptor_count INTEGER,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS push_subscriptions (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL,
-        user_agent TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS payroll_special_holidays (id SERIAL PRIMARY KEY, holiday_date TEXT NOT NULL UNIQUE, name TEXT NOT NULL, created_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS payroll_delivery_daily (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), work_date TEXT NOT NULL, amount_inr REAL NOT NULL DEFAULT 0, notes TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, work_date))`,
+      `CREATE TABLE IF NOT EXISTS user_face_profiles (user_id INTEGER PRIMARY KEY REFERENCES users(id), phash TEXT NOT NULL, reference_path TEXT, embedding_json TEXT, descriptor_count INTEGER, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS push_subscriptions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), endpoint TEXT NOT NULL UNIQUE, p256dh TEXT NOT NULL, auth TEXT NOT NULL, user_agent TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_push_subs_user ON push_subscriptions(user_id)`,
-      `CREATE TABLE IF NOT EXISTS hr_chat_messages (
-        id SERIAL PRIMARY KEY, thread_user_id INTEGER NOT NULL REFERENCES users(id),
-        author_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL,
-        read_by_other INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS hr_chat_messages (id SERIAL PRIMARY KEY, thread_user_id INTEGER NOT NULL REFERENCES users(id), author_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, read_by_other INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_hr_chat_thread ON hr_chat_messages(thread_user_id)`,
-      `CREATE TABLE IF NOT EXISTS hr_alerts (
-        id SERIAL PRIMARY KEY, type TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'warning',
-        message TEXT NOT NULL, user_id INTEGER REFERENCES users(id),
-        actor_id INTEGER REFERENCES users(id), meta TEXT, read_by_admin INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS hr_alerts (id SERIAL PRIMARY KEY, type TEXT NOT NULL, severity TEXT NOT NULL DEFAULT 'warning', message TEXT NOT NULL, user_id INTEGER REFERENCES users(id), actor_id INTEGER REFERENCES users(id), meta TEXT, read_by_admin INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_hr_alerts_created ON hr_alerts(created_at)`,
-      `CREATE TABLE IF NOT EXISTS login_otps (
-        id SERIAL PRIMARY KEY, email TEXT NOT NULL, code TEXT NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL, used INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS password_reset_tokens (
-        token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS password_reset_otps (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        otp_code TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS login_otps (id SERIAL PRIMARY KEY, email TEXT NOT NULL, code TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, used INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS password_reset_tokens (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS password_reset_otps (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), otp_code TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_pwreset_otp_user ON password_reset_otps(user_id)`,
-      `CREATE TABLE IF NOT EXISTS visibility_settings (
-        role TEXT NOT NULL, feature TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (role, feature)
-      )`,
-      `CREATE TABLE IF NOT EXISTS branch_access_rules (
-        role TEXT NOT NULL, branch_id INTEGER NOT NULL, accessible INTEGER NOT NULL DEFAULT 1,
-        PRIMARY KEY (role, branch_id)
-      )`,
-      `CREATE TABLE IF NOT EXISTS audit_logs (
-        id SERIAL PRIMARY KEY, action TEXT NOT NULL, entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL, actor_id INTEGER REFERENCES users(id), details TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS visibility_settings (role TEXT NOT NULL, feature TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (role, feature))`,
+      `CREATE TABLE IF NOT EXISTS branch_access_rules (role TEXT NOT NULL, branch_id INTEGER NOT NULL, accessible INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (role, branch_id))`,
+      `CREATE TABLE IF NOT EXISTS audit_logs (id SERIAL PRIMARY KEY, action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, actor_id INTEGER REFERENCES users(id), details TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id)`,
       `CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)`,
-      `CREATE TABLE IF NOT EXISTS custom_roles (
-        id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, permissions_json TEXT NOT NULL,
-        active INTEGER NOT NULL DEFAULT 1, created_by INTEGER REFERENCES users(id),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS user_role_assignments (
-        user_id INTEGER PRIMARY KEY REFERENCES users(id),
-        custom_role_id INTEGER NOT NULL REFERENCES custom_roles(id),
-        assigned_by INTEGER REFERENCES users(id), assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS webauthn_credentials (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        credential_id TEXT NOT NULL UNIQUE, public_key_b64 TEXT NOT NULL,
-        counter INTEGER NOT NULL DEFAULT 0, transports TEXT, device_label TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_used_at TIMESTAMPTZ
-      )`,
+      `CREATE TABLE IF NOT EXISTS custom_roles (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, permissions_json TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS user_role_assignments (user_id INTEGER PRIMARY KEY REFERENCES users(id), custom_role_id INTEGER NOT NULL REFERENCES custom_roles(id), assigned_by INTEGER REFERENCES users(id), assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS webauthn_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), credential_id TEXT NOT NULL UNIQUE, public_key_b64 TEXT NOT NULL, counter INTEGER NOT NULL DEFAULT 0, transports TEXT, device_label TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), last_used_at TIMESTAMPTZ)`,
       `CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user ON webauthn_credentials(user_id)`,
-      `CREATE TABLE IF NOT EXISTS biometric_update_requests (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        requester_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending', notes TEXT, reject_reason TEXT,
-        resolved_at TIMESTAMPTZ, resolved_by_id INTEGER REFERENCES users(id),
-        approval_expires_at TIMESTAMPTZ, completed_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS biometric_update_requests (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), requester_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', notes TEXT, reject_reason TEXT, resolved_at TIMESTAMPTZ, resolved_by_id INTEGER REFERENCES users(id), approval_expires_at TIMESTAMPTZ, completed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_bio_req_user_kind_status ON biometric_update_requests(user_id, kind, status)`,
-      `CREATE TABLE IF NOT EXISTS biometric_update_verifications (
-        id SERIAL PRIMARY KEY, request_user_id INTEGER REFERENCES users(id),
-        reviewed_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS profile_update_requests (
-        id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
-        requested_changes TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-        notes TEXT, reject_reason TEXT, resolved_by_id INTEGER REFERENCES users(id),
-        resolved_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS biometric_update_verifications (id SERIAL PRIMARY KEY, request_user_id INTEGER REFERENCES users(id), reviewed_by INTEGER REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS profile_update_requests (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), requested_changes TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', notes TEXT, reject_reason TEXT, resolved_by_id INTEGER REFERENCES users(id), resolved_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_profile_req_user_status ON profile_update_requests(user_id, status)`,
-      `CREATE TABLE IF NOT EXISTS system_guides (
-        id SERIAL PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL UNIQUE,
-        body TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0,
-        created_by INTEGER NOT NULL REFERENCES users(id),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
-      `CREATE TABLE IF NOT EXISTS apps_script_sync_log (
-        id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        tab TEXT, ok INTEGER NOT NULL DEFAULT 0, response_snippet TEXT, error TEXT
-      )`,
+      `CREATE TABLE IF NOT EXISTS system_guides (id SERIAL PRIMARY KEY, title TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, body TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0, created_by INTEGER NOT NULL REFERENCES users(id), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
+      `CREATE TABLE IF NOT EXISTS apps_script_sync_log (id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), tab TEXT, ok INTEGER NOT NULL DEFAULT 0, response_snippet TEXT, error TEXT)`,
       `CREATE INDEX IF NOT EXISTS idx_apps_script_log_created ON apps_script_sync_log(created_at)`,
-      `CREATE TABLE IF NOT EXISTS apps_script_sync_queue (
-        id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), tab TEXT NOT NULL,
-        payload_json TEXT NOT NULL, match_key TEXT, dedupe_key TEXT NOT NULL DEFAULT '',
-        attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
-        next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), dead INTEGER NOT NULL DEFAULT 0,
-        UNIQUE(tab, dedupe_key)
-      )`,
+      `CREATE TABLE IF NOT EXISTS apps_script_sync_queue (id SERIAL PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), tab TEXT NOT NULL, payload_json TEXT NOT NULL, match_key TEXT, dedupe_key TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT, next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), dead INTEGER NOT NULL DEFAULT 0, UNIQUE(tab, dedupe_key))`,
       `CREATE INDEX IF NOT EXISTS idx_apps_script_queue_next ON apps_script_sync_queue(dead, next_attempt_at)`,
-      `CREATE TABLE IF NOT EXISTS crm_leads (
-        id SERIAL PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT, email TEXT,
-        company TEXT, status TEXT NOT NULL DEFAULT 'new', notes TEXT,
-        created_by INTEGER NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )`,
+      `CREATE TABLE IF NOT EXISTS crm_leads (id SERIAL PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT, email TEXT, company TEXT, status TEXT NOT NULL DEFAULT 'new', notes TEXT, created_by INTEGER NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
       `CREATE INDEX IF NOT EXISTS idx_crm_leads_created ON crm_leads(created_at)`,
     ];
 
@@ -450,7 +299,6 @@ async function runMigrations(pool) {
   }
 }
 
-// ── Bootstrap data ────────────────────────────────────────────────────────────
 async function ensureBootstrapData(pool) {
   const branches = [
     { name: "Jaipur", lat: 26.99334, lng: 75.73716, radius_meters: 400 },
@@ -458,25 +306,13 @@ async function ensureBootstrapData(pool) {
     { name: "Meerut", lat: 28.96237, lng: 77.69552, radius_meters: 400 },
   ];
   for (const b of branches) {
-    await pool.query(
-      `INSERT INTO branches (name, lat, lng, radius_meters) VALUES ($1, $2, $3, $4)
-       ON CONFLICT (id) DO NOTHING`,
-      [b.name, b.lat, b.lng, b.radius_meters]
-    ).catch(async () => {
-      // Try by name
-      const ex = await pool.query("SELECT id FROM branches WHERE lower(name) = lower($1)", [b.name]);
-      if (!ex.rows[0]) {
-        await pool.query(
-          "INSERT INTO branches (name, lat, lng, radius_meters) VALUES ($1, $2, $3, $4)",
-          [b.name, b.lat, b.lng, b.radius_meters]
-        ).catch(() => {});
-      } else {
-        await pool.query(
-          "UPDATE branches SET lat=$1, lng=$2, radius_meters=$3 WHERE id=$4",
-          [b.lat, b.lng, b.radius_meters, ex.rows[0].id]
-        );
-      }
-    });
+    const ex = await pool.query("SELECT id FROM branches WHERE lower(name) = lower($1)", [b.name]);
+    if (!ex.rows[0]) {
+      await pool.query(
+        "INSERT INTO branches (name, lat, lng, radius_meters) VALUES ($1, $2, $3, $4)",
+        [b.name, b.lat, b.lng, b.radius_meters]
+      ).catch(() => {});
+    }
   }
 
   const depts = ["Sales Executive", "Courier Department", "IT", "Sales Employee", "Courier", "Sales", "Support", "Packing"];
@@ -497,40 +333,6 @@ async function ensureBootstrapData(pool) {
   }
 }
 
-async function seedInitialOrg(pool) {
-  let adminPw = String(process.env.SEED_ADMIN_PASSWORD || "").trim();
-  let autoGenerated = false;
-  if (!adminPw) adminPw = await readKv(pool, HRMS_BOOTSTRAP_PW_KEY);
-  if (!adminPw) { adminPw = crypto.randomBytes(24).toString("base64url"); autoGenerated = true; }
-
-  const superEmail = String(process.env.SUPER_ADMIN_EMAIL || "").trim() || "superadmin@hrms.local";
-
-  const branchRes = await pool.query(
-    "INSERT INTO branches (name, lat, lng, radius_meters) VALUES ($1, $2, $3, $4) RETURNING id",
-    ["Head Office", 28.6139, 77.209, 500]
-  );
-  const branchId = branchRes.rows[0].id;
-  const hash = bcrypt.hashSync(adminPw, 10);
-
-  await pool.query(
-    `INSERT INTO users (email, login_id, password_hash, full_name, role, branch_id, shift_start, shift_end, grace_minutes)
-     VALUES ($1, $2, $3, $4, $5, $6, '09:00', '18:00', 15) ON CONFLICT (email) DO NOTHING`,
-    [superEmail, "prakritiherbs", hash, "Mandeep Kumar", ROLES.SUPER_ADMIN, branchId]
-  );
-
-  const adminRow = await pool.query("SELECT id FROM users WHERE login_id = $1", ["prakritiherbs"]);
-  const adminId = adminRow.rows[0]?.id || 1;
-  await pool.query(
-    "INSERT INTO notices (title, body, created_by, active) VALUES ($1, $2, $3, 1) ON CONFLICT DO NOTHING",
-    ["Welcome to HRMS Portal", "Punch with GPS and optional live photo.", adminId]
-  );
-  await pool.query(
-    "INSERT INTO integration_kv (k, v) VALUES ($1, $2) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v",
-    [HRMS_BOOTSTRAP_PW_KEY, JSON.stringify({ password: adminPw })]
-  );
-  return { email: superEmail, adminPassword: adminPw, autoGenerated };
-}
-
 async function ensureSuperAdmin(pool) {
   const superEmail = String(process.env.SUPER_ADMIN_EMAIL || "").trim() || "superadmin@hrms.local";
   const envOverridePw = String(process.env.SUPER_ADMIN_PASSWORD || "").trim();
@@ -543,14 +345,8 @@ async function ensureSuperAdmin(pool) {
       ["Mandeep Kumar", ROLES.SUPER_ADMIN, id]
     );
     if (envOverridePw) {
-      const OKEY = "super_admin_pw_override_applied_hash";
-      const cHash = crypto.createHash("sha256").update(envOverridePw).digest("hex");
-      const stored = await pool.query("SELECT v FROM integration_kv WHERE k = $1", [OKEY]);
-      if (!stored.rows[0] || stored.rows[0].v !== cHash) {
-        await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2", [bcrypt.hashSync(envOverridePw, 10), id]);
-        await pool.query("INSERT INTO integration_kv (k,v) VALUES ($1,$2) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", [OKEY, cHash]);
-        console.log("[ensureSuperAdmin] ✓ SUPER_ADMIN_PASSWORD applied. Remove env var after first login.");
-      }
+      await pool.query("UPDATE users SET password_hash=$1 WHERE id=$2", [bcrypt.hashSync(envOverridePw, 10), id]);
+      console.log("[ensureSuperAdmin] Password updated from env");
     }
     return;
   }
@@ -563,39 +359,19 @@ async function ensureSuperAdmin(pool) {
      VALUES ($1, $2, $3, $4, $5, $6, '09:00', '18:00', 15) ON CONFLICT (email) DO NOTHING`,
     [superEmail, "prakritiherbs", bcrypt.hashSync(actualPw, 10), "Mandeep Kumar", ROLES.SUPER_ADMIN, branchId]
   );
-  await pool.query("INSERT INTO integration_kv (k,v) VALUES ($1,$2) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v",
-    [HRMS_BOOTSTRAP_PW_KEY, JSON.stringify({ password: actualPw })]);
-  console.log("[ensureSuperAdmin] ✓ Super admin created. Check logs for password.");
 }
 
-// ── Main openDb ───────────────────────────────────────────────────────────────
 let _dbInstance = null;
 
 async function openDb() {
   if (_dbInstance) return _dbInstance;
-
   const pool = getPool();
   await runMigrations(pool);
-  await pool.query("SELECT 1"); // Connection test
-
-  // Ensure integration_kv exists before secrets
+  await pool.query("SELECT 1");
   await pool.query(`CREATE TABLE IF NOT EXISTS integration_kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)`).catch(() => {});
   await hydrateRuntimeSecrets(pool);
-
-  const userCount = await pool.query("SELECT COUNT(*) AS c FROM users");
-  const wasEmpty = parseInt(userCount.rows[0].c) === 0;
-
-  if (wasEmpty) {
-    const info = await seedInitialOrg(pool);
-    console.warn("[hrms] ========== FIRST BOOT ==========");
-    console.warn("[hrms] Super admin:", info.email);
-    if (info.autoGenerated) console.warn("[hrms] Password:", info.adminPassword, "— SAVE THIS!");
-    console.warn("[hrms] ================================");
-  }
-
   await ensureBootstrapData(pool);
   await ensureSuperAdmin(pool);
-
   const db = makeDb(pool);
   _dbInstance = db;
   return db;
