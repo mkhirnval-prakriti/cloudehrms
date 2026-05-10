@@ -3,8 +3,7 @@
 set -e
 
 echo "[build] Installing root dependencies..."
-npm install --ignore-scripts
-
+npm install
 echo "[build] Installing client dependencies..."
 npm install --include=dev --prefix client
 
